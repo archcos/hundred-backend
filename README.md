@@ -49,10 +49,11 @@ Tables are created and migrated automatically on start.
 | `ADMIN_USERNAME` | Admin login username |
 | `ADMIN_TOKEN` | Admin login password, **at least 16 characters** (admin login is off otherwise) |
 | `IP_SALT` | Long random string used to hash visitor IPs (raw IPs are never stored) |
-| `WEB_ORIGIN` | The website's address, e.g. `https://your-site.com` (only this site may call the API) |
+| `WEB_ORIGIN` | The website's address, e.g. `https://your-site.com` (only this site may call the API). Several addresses are allowed, comma-separated: `http://localhost:3100,http://192.168.1.20:3100` |
 | `PORT` | Port to listen on (default 5100) |
 | `POSTS_PER_HOUR` | Letters + replies one person can post per hour, `0` = no limit |
 | `BLOCKED_WORDS` | Extra comma-separated blocked words (the rest are managed in the admin panel) |
+| `DEEPL_API_KEY` / `GOOGLE_TRANSLATE_API_KEY` / `LIBRETRANSLATE_URL` | Optional. Set one to show a **Translate** button on letters and replies (see Translation below) |
 | `TRUST_PROXY` | Set to `1` behind a proxy (Render, Railway, nginx) so rate limits see real IPs |
 
 ## Moderation, briefly
@@ -64,3 +65,15 @@ Tables are created and migrated automatically on start.
   but flagged for review.
 - **Reports** from visitors carry a reason. 3 reports hide an item until an admin reviews it.
 - **Admin login** uses a username and password, with a 15-minute lockout after 10 failed attempts.
+
+## Translation
+
+Readers press **Translate** on a letter to read it in their own language; nothing is translated automatically.
+Set one of `DEEPL_API_KEY`, `GOOGLE_TRANSLATE_API_KEY` or `LIBRETRANSLATE_URL` in `.env` to turn it on (with none set, the button is hidden).
+
+- **All languages:** the site asks the service which languages it supports, so readers can choose any of them.
+- **Saved:** each letter or reply is translated at most once per language; the result is kept (and removed with the letter at 100 days). The service is only called when someone presses the button, and each person is limited to 60 translations per 10 minutes.
+- **Cost:** letters are at most 500 characters (replies 300). DeepL's free plan allows 500,000 characters a month, roughly 3,000 average-length letters (about 100 a day), and each is only counted once because results are saved. Past that, either pay or self-host LibreTranslate.
+- **Moderation:** the blocked-word list and auto-flags only understand English. In the admin panel every letter and reply has **Translate to English** in its menu, so a moderator can read posts in other languages.
+- **Monthly budget:** `TRANSLATE_MONTHLY_LIMIT` (default 400,000 characters) stops translation before a free allowance runs out; readers then see "Translation is resting until next month".
+- **Privacy:** the text of the letter is sent to the translation service you choose.

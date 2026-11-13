@@ -71,7 +71,12 @@ const FLAG_RULES = [
   { flag: 'personal-info', hold: true, test: t => /[\w.+-]+@[\w-]+\.[a-z]{2,}/i.test(t) || (t.match(/\+?\d[\d\s().-]{7,}\d/g) || []).some(m => digits(m) >= 9) },
   { flag: 'code', hold: true, test: t => /<\s*\/?\s*(script|iframe|img|svg|object|embed|style|a|form|input|link|meta)\b|javascript:|\bon(error|load|click|mouse\w*|focus|blur)\s*=|\{\{|\$\{/i.test(t) },
   { flag: 'hidden-link', hold: true, test: t => /\b(dot|\(dot\)|\[dot\])\s*(com|net|org|io|xyz|me)\b|h\s+t\s+t\s+p|\w\s*[[(]\s*\.\s*[\])]\s*\w/i.test(t) },
-  { flag: 'garbled', hold: true, test: t => (t.match(/\p{M}/gu) || []).length > 15 },
+  // "Zalgo" text stacks several marks on every letter. Arabic vowel marks, Hindi and Thai use plenty of marks too,
+  // but about one per letter, so only flag when marks far outnumber the letters they sit on.
+  { flag: 'garbled', hold: true, test: t => {
+    const marks = (t.match(/\p{M}/gu) || []).length, letters = (t.match(/[^\p{M}\s]/gu) || []).length;
+    return marks > 15 && marks > 2 * letters;
+  } },
   { flag: 'threat', hold: false, test: t => /\b(kill|murder|bomb|shoot|stab|terror\w*|rape|massacre|gun)s?\b/i.test(t) },
   { flag: 'self-harm', hold: false, test: t => /\b(suicid\w*|kill (my|him|her)self|end my life|want to die|self[- ]?harm)\b/i.test(t) },
   { flag: 'spam', hold: false, test: t => {

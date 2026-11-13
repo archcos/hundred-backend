@@ -3,6 +3,7 @@ import mysql from 'mysql2/promise';
 import crypto from 'node:crypto';
 import { validateLetter, validateReply, boundsFilter, isUuid, autoFlags, blockedPattern, LIFETIME_DAYS, HIDE_AT_REPORTS, POSTS_PER_HOUR } from './lib.js';
 import { DEFAULT_BLOCKED_WORDS } from './blocklist.js';
+import { createTranslator, isLangCode } from './translate.js';
 
 const { DATABASE_URL, ADMIN_TOKEN = '', ADMIN_USERNAME = 'admin', IP_SALT = '', WEB_ORIGIN = 'http://localhost:3100', PORT = 5100, TRUST_PROXY } = process.env;
 if (!DATABASE_URL) throw new Error('Set DATABASE_URL in server/.env');
@@ -74,6 +75,36 @@ await db.query(`CREATE TABLE IF NOT EXISTS admin_log (
   INDEX (at)
 ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
 
+// Translations: one saved result per letter/reply and language, so each is translated at most once per language.
+// `same` = the text was already in the requested language (nothing to show). Derived data, cleaned up with the expiry job.
+await db.query(`CREATE TABLE IF NOT EXISTS translations (
+  item_type VARCHAR(8) NOT NULL, item_id INT NOT NULL, lang VARCHAR(12) NOT NULL,
+  text TEXT NOT NULL, from_lang VARCHAR(12) NOT NULL DEFAULT '', same TINYINT NOT NULL DEFAULT 0,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (item_type, item_id, lang)
+) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+const translator = createTranslator(); // null when no provider is configured in .env
+console.log(translator ? `Translation: ${translator.name}` : 'Translation: off (set DEEPL_API_KEY, GOOGLE_TRANSLATE_API_KEY or LIBRETRANSLATE_URL to turn it on)');
+const translateHits = new Map(); // ip hash -> timestamps, an in-memory limiter (see translateAllowed)
+
+// Monthly character budget for the translation service, so a busy month can't run past a free allowance
+// (DeepL Free and Google both give about 500,000 characters a month). TRANSLATE_MONTHLY_LIMIT=0 means no limit.
+const MONTHLY_LIMIT = Number(process.env.TRANSLATE_MONTHLY_LIMIT ?? 400000);
+const budgetKey = () => `translate_chars_${new Date().toISOString().slice(0, 7)}`;
+const BUDGET_MSG = 'Translation is resting until next month.';
+async function checkBudget(chars) {
+  if (!(MONTHLY_LIMIT > 0)) return;
+  const [[row]] = await db.query('SELECT v FROM meta WHERE k = ?', [budgetKey()]);
+  if (Number(row?.v || 0) + chars > MONTHLY_LIMIT) throw Object.assign(new Error(BUDGET_MSG), { budget: true });
+}
+const spend = chars => db.query('INSERT INTO meta (k, v) VALUES (?, ?) ON DUPLICATE KEY UPDATE v = v + ?', [budgetKey(), String(chars), chars]);
+// Every route that calls the provider answers a budget stop with 429 and any other failure with 502.
+const translateFailure = (res, e, fallback) => {
+  if (e.budget) return res.status(429).json({ error: BUDGET_MSG });
+  console.error('translate failed:', e.message);
+  return res.status(502).json({ error: fallback });
+};
+
 // Moderation: banned authors (by salted IP hash) and blocked words managed from the admin panel.
 await db.query(`CREATE TABLE IF NOT EXISTS bans (
   ip_hash CHAR(64) PRIMARY KEY, reason VARCHAR(200) NOT NULL DEFAULT '',
@@ -98,14 +129,33 @@ await loadBlocked();
 
 // The 100-day rule: delete hourly, and never serve anything older anyway.
 // This automatic expiry (archived letters included) is the ONLY thing that permanently deletes content.
-const purge = () => db.query('DELETE FROM letters WHERE created_at < NOW() - INTERVAL ? DAY', [LIFETIME_DAYS]).catch(console.error);
+const purge = async () => {
+  try {
+    await db.query('DELETE FROM letters WHERE created_at < NOW() - INTERVAL ? DAY', [LIFETIME_DAYS]);
+    // Saved translations are derived data: drop the ones whose letter or reply is gone.
+    await db.query(`DELETE t FROM translations t
+      LEFT JOIN letters l ON t.item_type = 'letters' AND l.id = t.item_id
+      LEFT JOIN replies r ON t.item_type = 'replies' AND r.id = t.item_id
+      WHERE (t.item_type = 'letters' AND l.id IS NULL) OR (t.item_type = 'replies' AND r.id IS NULL)`);
+    translateHits.clear();
+  } catch (e) { console.error(e); }
+};
 purge(); setInterval(purge, 60 * 60 * 1000);
 
 const app = express();
 if (TRUST_PROXY) app.set('trust proxy', Number(TRUST_PROXY) || TRUST_PROXY); // set to 1 behind Render/Railway/nginx
 app.use(express.json({ limit: '64kb' })); // room for /api/letters/alive id lists; letters are length-checked separately
+// WEB_ORIGIN can be one address or several, comma-separated. Browsers only accept ONE origin in this header,
+// so reply with the caller's origin when it's on the list (otherwise the first one).
+const ALLOWED_ORIGINS = WEB_ORIGIN.split(',').map(o => o.trim().replace(/\/$/, '')).filter(Boolean);
 app.use((req, res, next) => {
-  res.set({ 'Access-Control-Allow-Origin': WEB_ORIGIN, 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Access-Control-Allow-Methods': 'GET, POST' });
+  const origin = req.get('origin');
+  res.set({
+    'Access-Control-Allow-Origin': ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0],
+    Vary: 'Origin',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET, POST',
+  });
   req.method === 'OPTIONS' ? res.sendStatus(204) : next();
 });
 
@@ -170,6 +220,63 @@ app.get('/api/letters/:uid', async (req, res) => {
   row ? res.json(row) : res.status(404).json({ error: 'This letter has faded away.' });
 });
 
+// ---------- Translation (a reader presses "Translate"; nothing is translated automatically) ----------
+// At most 60 translate requests per person per 10 minutes. Results are saved, so repeats cost nothing.
+const translateAllowed = ip => {
+  const now = Date.now(), hits = (translateHits.get(ip) || []).filter(t => now - t < 600e3);
+  if (hits.length >= 60) { translateHits.set(ip, hits); return false; }
+  hits.push(now); translateHits.set(ip, hits); return true;
+};
+
+// items: [{ type: 'letters' | 'replies', id, body }] -> Map "type:id" -> { text, from, same }. Saved ones come from the
+// database; the rest go to the provider in one batch and are saved.
+async function translateItems(items, lang) {
+  const key = lang.toLowerCase(), out = new Map();
+  const ids = type => items.filter(i => i.type === type).map(i => i.id);
+  const cached = [];
+  for (const type of ['letters', 'replies']) {
+    if (!ids(type).length) continue;
+    const [rows] = await db.query('SELECT item_type, item_id, text, from_lang, same FROM translations WHERE item_type = ? AND lang = ? AND item_id IN (?)', [type, key, ids(type)]);
+    cached.push(...rows);
+  }
+  for (const r of cached) out.set(`${r.item_type}:${r.item_id}`, { text: r.text, from: r.from_lang, same: !!r.same });
+  const todo = items.filter(i => !out.has(`${i.type}:${i.id}`));
+  if (todo.length) {
+    const chars = todo.reduce((n, i) => n + i.body.length, 0);
+    await checkBudget(chars);
+    const results = await translator.translateMany(todo.map(i => i.body), lang);
+    await spend(chars);
+    const rows = todo.map((i, n) => {
+      const r = results[n] ?? { text: '', from: '', same: false };
+      out.set(`${i.type}:${i.id}`, { text: r.same ? '' : r.text, from: r.from, same: r.same });
+      return [i.type, i.id, key, r.same ? '' : r.text, r.from || '', r.same ? 1 : 0];
+    });
+    await db.query('INSERT IGNORE INTO translations (item_type, item_id, lang, text, from_lang, same) VALUES ?', [rows]);
+  }
+  return out;
+}
+
+// Which languages readers can translate into (whatever the configured provider supports).
+app.get('/api/translate/languages', async (req, res) => {
+  res.json(translator ? { enabled: true, languages: await translator.languages() } : { enabled: false, languages: [] });
+});
+
+// Translate a letter and its replies into `lang` in one request.
+app.post('/api/letters/:uid/translate', async (req, res) => {
+  if (!translator) return res.status(501).json({ error: 'Translation is not set up on this site.' });
+  const lang = req.body?.lang;
+  if (!isLangCode(lang)) return res.status(400).json({ error: 'Pick a language.' });
+  if (!translateAllowed(ipHash(req))) return res.status(429).json({ error: 'You are translating a lot. Try again in a few minutes.' });
+  const [[letter]] = await db.query(`SELECT id, body FROM letters WHERE uid = ? AND ${visible}`, [req.params.uid]);
+  if (!letter) return res.status(404).json({ error: 'This letter has faded away.' });
+  const [replies] = await db.query(`SELECT id, body FROM replies WHERE letter_id = ? AND reports < ? AND held = 0 AND archived_at IS NULL ORDER BY id LIMIT 200`, [letter.id, HIDE_AT_REPORTS]);
+  try {
+    const got = await translateItems([{ type: 'letters', id: letter.id, body: letter.body }, ...replies.map(r => ({ type: 'replies', id: r.id, body: r.body }))], lang);
+    res.json({ lang, provider: translator.name, letter: got.get(`letters:${letter.id}`),
+      replies: Object.fromEntries(replies.map(r => [r.id, got.get(`replies:${r.id}`)])) });
+  } catch (e) { translateFailure(res, e, "The translation service couldn't translate that. Try again, or pick another language."); }
+});
+
 // Total count + hotspots: ~100 km grid cells holding 2 or more letters, each with its most-used paper.
 app.get('/api/stats', async (req, res) => {
   // ponytail: groups every visible letter on each call; cache this for a minute if traffic gets heavy
@@ -186,7 +293,7 @@ app.get('/api/stats', async (req, res) => {
   }
   const hotspots = [...cells.values()].filter(c => c.n >= 2).sort((a, b) => b.n - a.n).slice(0, 10)
     .map(c => ({ lat: c.slat / c.n, lng: c.slng / c.n, n: c.n, paper: c.paper, cell: `${c.cy},${c.cx}` })); // cell = ROUND(lat),ROUND(lng)
-  res.json({ total, hotspots });
+  res.json({ total, hotspots, translate: !!translator });
 });
 
 app.post('/api/letters', async (req, res) => {
@@ -340,6 +447,19 @@ const KINDS = {
   replies: { table: 'replies', reports: 'reply_reports', fk: 'reply_id' },
 };
 app.param('kind', (req, res, next, kind) => (KINDS[kind] ? next() : res.status(404).json({ error: 'Not found.' })));
+// Moderators: read a post in English. Languages the blocked-word list doesn't understand (Japanese, Arabic…)
+// can only be checked by a person, so this is how an admin reads them.
+app.post('/api/admin/:kind/:id/translate', async (req, res) => {
+  if (!translator) return res.status(501).json({ error: 'Translation is not set up. Add a provider key to server/.env.' });
+  const kind = req.params.kind, id = Number(req.params.id);
+  const [[row]] = await db.query(`SELECT id, body FROM ${KINDS[kind].table} WHERE id = ?`, [id]);
+  if (!row) return res.status(404).json({ error: 'Not found.' });
+  try {
+    const got = await translateItems([{ type: kind, id, body: row.body }], 'en');
+    res.json({ provider: translator.name, ...got.get(`${kind}:${id}`) });
+  } catch (e) { translateFailure(res, e, "The translation service couldn't translate that."); }
+});
+
 const snippet = async (kind, id) => {
   const [[row]] = await db.query(`SELECT LEFT(body, 80) AS b FROM ${KINDS[kind].table} WHERE id = ?`, [id]);
   return row ? `“${row.b}”` : '';
@@ -362,9 +482,12 @@ app.get('/api/admin/:kind', async (req, res) => {
   const t = req.params.kind === 'letters' ? 'l' : 'r';
   const { sql, params } = adminWhere(req.query, t);
   const common = `${t}.id, ${t}.body, ${t}.name, ${t}.reports, ${t}.flags, ${t}.held, ${t}.archived_at, LEFT(${t}.ip_hash, 8) AS author,
-    TIMESTAMPDIFF(SECOND, ${t}.created_at, NOW()) / 86400 AS age_days`;
+    ${t}.created_at, TIMESTAMPDIFF(SECOND, ${t}.created_at, NOW()) / 86400 AS age_days`;
   // ponytail: newest 200 matches; add paging when moderation queues get longer
-  const order = `ORDER BY ${t}.held DESC, (${t}.flags <> '') DESC, ${t}.reports DESC, ${t}.id DESC LIMIT 200`;
+  // Default is newest first. ?sort=attention puts held / flagged / most-reported items on top instead.
+  const order = req.query.sort === 'attention'
+    ? `ORDER BY ${t}.held DESC, (${t}.flags <> '') DESC, ${t}.reports DESC, ${t}.created_at DESC, ${t}.id DESC LIMIT 200`
+    : `ORDER BY ${t}.created_at DESC, ${t}.id DESC LIMIT 200`;
   const [rows] = await db.query(req.params.kind === 'letters'
     ? `SELECT ${common}, l.uid, l.lat, l.lng, l.font, l.paper, (SELECT COUNT(*) FROM replies x WHERE x.letter_id = l.id) AS replies
        FROM letters l ${sql} ${order}`

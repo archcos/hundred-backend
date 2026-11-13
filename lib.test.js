@@ -13,6 +13,11 @@ test('autoFlags', () => {
   assert.deepEqual(f('visit mysite dot com').flags, ['hidden-link']);
   assert.ok(f('go to site[.]xyz').held);
   assert.ok(f('h̸̡̛e̷̛͓l̴̢̛l̵̡̛ơ̸̢ w̵̢̛ơ̴̢r̸̢̛l̷̢̛d̵̢̛').held); // zalgo
+  // Other scripts are normal letters, not "garbled": Arabic with vowel marks, Hindi, Thai, Japanese, Korean.
+  for (const ok of ['السَّلَامُ عَلَيْكُمْ وَرَحْمَةُ اللَّهِ وَبَرَكَاتُهُ، أحبُّ هذا المكانَ كثيرًا', 'मुझे यह जगह बहुत पसंद है, मैं यहाँ फिर आऊँगा। धन्यवाद दोस्तों',
+    'ฉันรักสถานที่แห่งนี้มาก ขอบคุณสำหรับทุกอย่างที่ผ่านมา', 'この場所が大好きです。ありがとう、また来ます。がんばって！', '이곳이 정말 좋아요. 다시 올게요, 고마워요']) {
+    assert.deepEqual(f(ok), { flags: [], held: false }, `wrongly flagged: ${ok.slice(0, 20)}`);
+  }
   assert.deepEqual(f('I will kill you'), { flags: ['threat'], held: false });
   assert.deepEqual(f('some days I want to die').flags, ['self-harm']);
   assert.deepEqual(f('BUY NOW THIS IS THE BEST DEAL EVER').flags, ['spam']);
